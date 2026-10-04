@@ -8,13 +8,13 @@ Nothing here assumes Rust, AGOS, or any particular directory layout.
 One line, on any machine that has [cline](https://github.com/cline/cline) on `PATH`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/USER/autodev/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/aimonext/cline-autodev/main/install.sh | sh
 ```
 
 No `sudo`, no root — everything lands in `~/.local`. To install system-wide:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/USER/autodev/main/install.sh | sh -s -- --prefix /usr/local
+curl -fsSL https://raw.githubusercontent.com/aimonext/cline-autodev/main/install.sh | sh -s -- --prefix /usr/local
 ```
 
 Prefer to clone it? `git clone <repo> && cd autodev && ./install.sh` works too —
@@ -28,10 +28,12 @@ Uninstall (keeps your jobs and config):
 
 ### Requirements
 
-- `bash` (the commands use bash arrays/`local`)
-- `cline` on `PATH`
-- `git`, `flock`, `pgrep` — standard on Linux; on macOS `pgrep -f` needs no extra package but `flock` may
-- No root required
+- **Linux** (uses `/proc`, `pgrep -f`, `flock`). Not macOS/BSD — see
+  [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+- `bash` — the commands use `local` and arrays
+- [`cline`](https://github.com/cline/cline) on `PATH`
+- `git`
+- No root or `sudo` required
 
 ## Commands
 
@@ -46,6 +48,9 @@ Uninstall (keeps your jobs and config):
 | `autodev-stop <job>` | Stop supervisor **and** orphaned agents, then verify. |
 | `autodev-queue-done` | Exit 0 when a task queue is drained. Used by `JOB_DONE_CMD`. |
 
+`autodev-status` exit codes are a contract for monitoring: **0 idle, 1 running,
+2 crashed**. 0 and 1 are both healthy; only 2 means work has stopped.
+
 ## Quick start
 
 ```sh
@@ -56,6 +61,19 @@ autodev-status
 
 `autodev-add` detects: Rust, PHP/Laravel, Node, Python, Go, Make, or falls back
 to `generic`. It writes a prompt containing that stack's real verify commands.
+
+## Safety
+
+- **One agent per repository, enforced.** `start` refuses when any agent process
+  already has that repo as its working directory — including one left by a
+  different supervisor. Two agents in one tree corrupt each other's commits.
+- **Disk guard.** A run will not start when free space is below
+  `AUTODEV_MIN_FREE_MB` (default 1024). A full disk kills a build mid-flight.
+- **Bounded logs.** Only `AUTODEV_KEEP_RUN_LOGS` (default 5) run transcripts are
+  kept per job.
+- **Graceful drain.** When `JOB_DONE_CMD` reports the queue empty, the supervisor
+  exits permanently instead of waking forever.
+- **Circuit breaker.** 8 consecutive failures halts a job.
 
 ## Layout
 
@@ -122,3 +140,13 @@ autodev-daemon start agos-tools
 
 Both systems share the one-agent-per-repo rule, so stop the old supervisor for
 a repo before starting the new one.
+
+## Contributing
+
+Read [`AGENTS.md`](AGENTS.md) first — it documents the safety invariants, the
+exit-code contract, and the limitations that are deliberate. It also has the
+pre-commit checklist (syntax gate plus a throwaway-`$HOME` install test).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

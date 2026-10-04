@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # autodev installer — installs the autodev-* commands for the current user.
 #
-#   curl -fsSL https://raw.githubusercontent.com/USER/autodev/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/aimonext/cline-autodev/main/install.sh | sh
 #
 # Or from a checkout:  ./install.sh
 #
@@ -15,8 +15,7 @@
 set -eu
 
 VERSION="1.0.0"
-REPO_URL="${AUTODEV_REPO:-https://github.com/USER/autodev}"
-RAW_URL="${AUTODEV_RAW:-https://raw.githubusercontent.com/USER/autodev/main}"
+RAW_URL="${AUTODEV_RAW:-https://raw.githubusercontent.com/aimonext/cline-autodev/main}"
 
 PREFIX="${AUTODEV_PREFIX:-$HOME/.local}"
 BINDIR="$PREFIX/bin"
@@ -72,13 +71,17 @@ fi
 
 
 # ---------------------------------------------------------------- source dir
-# Prefer a real checkout (running ./install.sh, or a cloned repo); otherwise
-# fetch each file from the raw URL. Fetching one file at a time is what makes
-# this work from a `curl | sh` pipe, where no checkout exists on disk.
+# Prefer a real checkout, so `git clone && ./install.sh` needs no network.
+#
+# The `-f "$0"` test matters: when this script is piped (`curl ... | sh`), $0 is
+# "sh", not a path. Without it, running the one-liner from inside an autodev
+# checkout would silently install the LOCAL working tree instead of the remote
+# release — same idea, possibly very different content.
 SRC=""
-self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || echo "")
-if [ -n "$self_dir" ] && [ -f "$self_dir/lib/common.sh" ]; then
-  SRC="$self_dir"
+self_dir=""
+if [ -f "$0" ]; then
+  self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || echo "")
+  [ -n "$self_dir" ] && [ -f "$self_dir/lib/common.sh" ] && SRC="$self_dir"
 fi
 
 fetch() {  # fetch <relative-path> <dest>
