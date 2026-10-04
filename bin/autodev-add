@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+# autodev-add — register ANY project as an autodev job.
+#
+# This is what makes autodev universal. Point it at a git repo of any language
+# and it DETECTS the stack, the build/test commands, and any task-tracking file,
+# then writes a job file plus a matching prompt. Nothing about Rust, AGOS, or any
+# particular layout is assumed.
+#
+# Usage:
+#   autodev-add <path> [--name <job>] [--force] [--no-prompt]
+#
+# Detection is best-effort and every choice is printed and written into the job
+# file, so it is trivial to correct by hand afterwards.
+
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
+set -uo pipefail
+
+# --- locate the autodev shared library -------------------------------------
+# Works for a system-wide install, a per-user install, or a git checkout.
+# $AUTODEV_LIB overrides the search for unusual layouts.
+_ad_libdir() {
+  local c d
+  for c in "${AUTODEV_LIB:-}" "$HOME/.local/lib/autodev" "$HOME/lib/autodev" \
+           "/usr/local/lib/autodev" "/usr/lib/autodev" "/opt/autodev/lib"; do
+    [ -n "$c" ] && [ -f "$c/common.sh" ] && { printf '%s' "$c"; return 0; }
+  done
+  d=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || return 1
+  for c in "$d/../lib/autodev" "$d/../lib" "$d/lib"; do
+    [ -f "$c/common.sh" ] && { (CDPATH= cd -- "$c" && pwd); return 0; }
+  done
+  return 1
+}
+if ! _AD_LIB=$(_ad_libdir); then
+  printf 'autodev: cannot find lib/common.sh.\n' >&2
+  printf '  Reinstall, or set AUTODEV_LIB to the directory holding common.sh.\n' >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "$_AD_LIB/common.sh"
+
+TARGET=""; NAME=""; FORCE=0; GEN_PROMPT=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --name) NAME="${2:-}"; shift 2 ;;
+    --force) FORCE=1; shift ;;
+    --no-prompt) GEN_PROMPT=0; shift ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    *) TARGET="$1"; shift ;;
+  esac
+done
+
+[ -n "$TARGET" ] || { sed -n '2,20p' "$0"; exit 1; }
+[ -d "$TARGET" ] || { echo "autodev-add: no such directory: $TARGET" >&2; exit 1; }
+REPO="$(cd "$TARGET" && pwd)"
+[ -n "$NAME" ] || NAME="$(basename "$REPO")"
+
+# A nested repo inside another registered repo is a footgun for the
+# one-agent-per-repo rule only if they share a tree; separate trees are fine.
+if ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  echo "WARNING: $REPO is not a git repository." >&2
+  echo "         autodev can still run it, but there is no commit/branch safety." >&2
+fi
+
+mkdir -p "$JOBS_DIR" "$PROMPTS_DIR"
+JOBFILE="$JOBS_DIR/$NAME.conf"
+if [ -f "$JOBFILE" ] && [ "$FORCE" -eq 0 ]; then
+  echo "autodev-add: job '$NAME' already exists ($JOBFILE). Use --force to overwrite." >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------- stack detect
+STACK="generic"; BUILD=""; TEST=""; LINT=""; SETUP=""
+if [ -f "$REPO/Cargo.toml" ]; then
+  STACK="rust"
+  BUILD='PATH="$HOME/.cargo/bin:$PATH" cargo build --all-targets'
+  TEST='PATH="$HOME/.cargo/bin:$PATH" cargo test --all-targets'
+  LINT='PATH="$HOME/.cargo/bin:$PATH" cargo clippy --all-targets -- -D warnings && PATH="$HOME/.cargo/bin:$PATH" cargo fmt --all --check'
+  SETUP='export PATH="$HOME/.cargo/bin:$PATH"'
+elif [ -f "$REPO/composer.json" ]; then
+  STACK="php"
+  if [ -f "$REPO/artisan" ]; then
+    TEST='php artisan test'
+    LINT='[ -x vendor/bin/pint ] && vendor/bin/pint --test'
+    [ -f "$REPO/vendor/bin/phpstan" ] && LINT="$LINT && vendor/bin/phpstan analyse --no-progress"
+  else
+    TEST='[ -x vendor/bin/phpunit ] && vendor/bin/phpunit'
+  fi
+  BUILD='composer install --no-interaction --prefer-dist'
+elif [ -f "$REPO/package.json" ]; then
+  STACK="node"
+  if [ -f "$REPO/pnpm-lock.yaml" ]; then PM=pnpm
+  elif [ -f "$REPO/yarn.lock" ]; then PM=yarn
+  else PM=npm; fi
+  BUILD="$PM install"
+  TEST="$PM test"
+  LINT="[ -x node_modules/.bin/eslint ] && node_modules/.bin/eslint . || true"
+elif [ -f "$REPO/pyproject.toml" ] || [ -f "$REPO/setup.py" ] || [ -f "$REPO/requirements.txt" ]; then
+  STACK="python"
+  BUILD='[ -f requirements.txt ] && pip install -r requirements.txt || true'
+  TEST='[ -f pyproject.toml ] && python -m pytest -q || python -m unittest discover'
+  LINT='[ -f pyproject.toml ] && python -m ruff check . || true'
+elif [ -f "$REPO/go.mod" ]; then
+  STACK="go"
+  BUILD='go build ./...'
+  TEST='go test ./...'
+  LINT='[ -x "$(command -v golangci-lint)" ] && golangci-lint run || go vet ./...'
+elif [ -f "$REPO/Makefile" ]; then
+  STACK="make"
+  TEST='make test'
+  LINT='[ -n "$(command -v shellcheck)" ] && shellcheck . || true'
+fi
+
+# ---------------------------------------------------------------- task detect
+# Look for a task-tracking file the repo already maintains. Purely optional:
+# when none is found the job still runs; `autodev-status` just reports the task
+# as unspecified. Order matters — the first match wins, most specific first.
+#
+# The regexes are deliberately tolerant of Markdown emphasis (`**T073**`), which
+# is what made a hand-written matcher report "unknown" on every single run.
+TASKFILE=""; TASK_RE=""; DONE_CMD=""
+detect_task() {
+  case "$1" in
+    # A queue is better served by the "first NON-terminal task" scan in
+    # ad_task_label than by a regex, which would report the first heading
+    # whether or not that work is already DONE. Leave TASK_RE empty on purpose.
+    *QUEUE.md)     TASK_RE='' ;;
+    # For state files, require a task id on the line so a bare "## Current State"
+    # heading is not reported as if it were a task.
+    *CURRENT_STATE*|*STATE.md)
+                   TASK_RE='^[[:space:]]*(\*\*)?(Current|Next)[[:space:]]+(task|action|phase|step)[^A-Za-z0-9]{0,4}(T|P|ENV|[0-9])|^[[:space:]]*Implement[[:space:]]+\**T[0-9]+' ;;
+    *TASKS.md)     TASK_RE='' ;;
+    *)             TASK_RE='' ;;
+  esac
+  # A queue-shaped file can also drive the drained check.
+  case "$1" in
+    *QUEUE.md|*TASKS.md|*TASK_INDEX.md|*TASK_QUEUE.md)
+      DONE_CMD="autodev-queue-done paired \"\$REPO/$1\" '^#+[[:space:]]*[A-Za-z]*-?[0-9]+' DONE" ;;
+  esac
+}
+for cand in .agent/progress/STATE.md .agent/progress/CURRENT_STATE.md \
+            .agent/progress/QUEUE.md .agent/progress/TASKS.md \
+            .agent/progress/TASK_INDEX.md .agent/progress/TASK_QUEUE.md \
+            TASKS.md docs/TASKS.md .agent/IMPLEMENTATION.md; do
+  if [ -f "$REPO/$cand" ]; then
+    TASKFILE="$cand"
+    detect_task "$cand"
+    break
+  fi
+done
+
+# ---------------------------------------------------------------- write job
+PROMPTPATH="$PROMPTS_DIR/$NAME.md"
+{
+  echo "# autodev job: $NAME"
+  echo "# Generated by autodev-add. Edit freely — it is a normal shell fragment."
+  echo "JOB_NAME=$NAME"
+  echo "JOB_REPO=$REPO"
+  [ "$GEN_PROMPT" -eq 1 ] && echo "PROMPT=$PROMPTPATH"
+  echo "JOB_STACK=$STACK"
+  [ -n "$TASKFILE" ] && echo "JOB_TASKFILE=$TASKFILE"
+  [ -n "$TASK_RE" ]  && echo "JOB_TASK_RE=$(printf '%q' "$TASK_RE")"
+  [ -n "$DONE_CMD" ] && echo "JOB_DONE_CMD=$(printf '%q' "$DONE_CMD")"
+  echo "#"
+  echo "# Verified commands detected for this stack ($STACK):"
+  [ -n "$BUILD" ] && echo "#   build : $BUILD"
+  [ -n "$TEST" ]  && echo "#   test  : $TEST"
+  [ -n "$LINT" ]  && echo "#   lint  : $LINT"
+} > "$JOBFILE"
+
+# ---------------------------------------------------------------- write prompt
+if [ "$GEN_PROMPT" -eq 1 ]; then
+  {
+    echo "# autodev prompt for $NAME ($STACK) — generated $(date -u +%FT%TZ)"
+    echo "# Generic by design: the agent discovers this project's own conventions"
+    echo "# rather than assuming any particular language or layout."
+    cat <<EOF
+You are an autonomous AI development agent working on the "$NAME" project.
+
+You are UNATTENDED. No human is watching or answering questions. Never stop to
+ask for confirmation — decide, act, record, and move on. A supervisor invokes
+you repeatedly; when you finish, you are invoked again. When the work is
+exhausted the supervisor shuts down on its own.
+
+## 1. Orient yourself (first, every run)
+
+    cd $REPO
+    git status
+    git log --oneline -10
+
+Read whatever the project provides for agents and humans — README, AGENTS.md,
+CLAUDE.md, CONTRIBUTING.md, docs/. Documents can be stale; the code is the
+truth. If prose disagrees with the code, trust the code and say so.
+
+Identify the project's own conventions for tests, linting and formatting, and
+follow them. Do not impose conventions from a different project.
+
+## 2. Choose the work
+
+Pick the single next well-defined unit of work: the next item in the project's
+own task list, issue tracker, or TODO markers, whichever the repo actually uses.
+Work on EXACTLY ONE unit per run.
+
+If the project has no task list, choose the highest-value small improvement you
+can verify, and record why you chose it.
+
+Keep changes strictly inside that scope. No unrelated refactoring, no dependency
+churn, no drive-by formatting.
+
+## 3. Implement
+
+Real code plus tests. Every behavior change needs a test. Tests must be
+deterministic: no live network, no live external services, no real credentials.
+
+## 4. Verify — mandatory
+
+Run the project's real checks before claiming anything is done:
+
+EOF
+    [ -n "$SETUP" ] && printf '    %s\n\n' "$SETUP"
+    [ -n "$LINT" ]  && printf '    %s\n' "$LINT"
+    [ -n "$TEST" ]  && printf '    %s\n' "$TEST"
+    [ -n "$BUILD" ] && printf '    %s\n' "$BUILD"
+    cat <<'EOF'
+
+NEVER report a command as passing unless you executed it and read the real
+output. Never invent, estimate, or "recall" test counts — quote the actual
+result lines. If a command could not run, state the actual error verbatim.
+Fabricated verification is your worst possible failure: it poisons every agent
+that follows you.
+
+If a check fails, fix the defect your change introduced and re-run until truly
+green. Never weaken or delete a test to make it pass, add blanket ignore/allow
+attributes, or loosen a linter to silence a real finding.
+
+## 5. Commit
+
+Only after checks genuinely pass:
+
+    git add -A && git commit -m "<type>(<scope>): <summary>"
+
+Match the existing commit-message convention; look at `git log` for it.
+Do NOT push. Do NOT force-push, hard-reset, or discard uncommitted work.
+
+## 6. Leave a handoff
+
+Before finishing, write down what you did, what you verified (with real output),
+what you did not do, and what the next step is — in whatever handoff file the
+project already uses. The next agent must be able to continue without a
+transcript. That is the entire point: those files are the only handoff.
+
+## 7. If blocked
+
+Stop that work cleanly. Do NOT fake an implementation and do NOT mark anything
+complete. Record the exact issue, the evidence, what you tried, and what is
+needed to unblock it.
+
+## 8. Know when to stop
+
+Stop cleanly, do not thrash, and say so plainly when:
+- There is no well-defined next unit of work.
+- The same blocker has failed 3+ times.
+- You are about to make a destructive or security-sensitive change (auth,
+  secrets, bind address, exposure, deletion) that nothing documents.
+
+## 9. Final response
+
+State: what you did, files changed, checks run with their REAL results, known
+limitations, and the next step.
+EOF
+  } > "$PROMPTPATH"
+fi
+
+# ---------------------------------------------------------------- slots.conf
+# Add to the rotation if not already listed, so a new job is reachable.
+if [ ! -f "$SLOTS_CONF" ]; then
+  echo "# Priority order, highest first. One job name per line." > "$SLOTS_CONF"
+fi
+if ! grep -qxF "$NAME" "$SLOTS_CONF" 2>/dev/null; then
+  echo "$NAME" >> "$SLOTS_CONF"
+  echo "autodev-add: added '$NAME' to $SLOTS_CONF (lowest priority)"
+fi
+
+# ---------------------------------------------------------------- report
+echo "Registered job '$NAME'"
+echo "  repo      : $REPO"
+echo "  stack     : $STACK$(git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 && echo ' (git)' || echo ' (NO GIT)')"
+echo "  job file  : $JOBFILE"
+[ "$GEN_PROMPT" -eq 1 ] && echo "  prompt    : $PROMPTPATH"
+[ -n "$TASKFILE" ] && echo "  task file : $TASKFILE (auto-detected)"
+[ -z "$TASKFILE" ] && echo "  task file : none found — task reports 'unspecified' (fine)"
+[ -n "$DONE_CMD" ] && echo "  done check: queue-drained detection wired"
+echo
+echo "Next:"
+echo "  autodev-daemon start $NAME      # run it now"
+echo "  autodev-status                  # see everything"
+echo "  autodev-scheduler start         # auto-fill idle slots"

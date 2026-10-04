@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# autodev-status — one-shot verdict on every supervised agent on this machine.
+#
+#   exit 0 = all idle/ok        exit 1 = at least one agent running
+#   exit 2 = a supervisor CRASHED (work is NOT happening)
+#
+# "Idle" and "crashed" are deliberately different verdicts. A queued job that
+# has not started yet is idle, not broken — on a small box that is the normal
+# state for most jobs, and reporting it as a failure cried wolf.
+#
+# Generic: discovers jobs from the config dir and reads each job's own repo.
+# There is no hardcoded project name, language, or task-file path.
+
+set -u
+# shellcheck disable=SC3040
+(set -o pipefail) 2>/dev/null && set -o pipefail
+
+# --- locate the autodev shared library -------------------------------------
+# Works for a system-wide install, a per-user install, or a git checkout.
+# $AUTODEV_LIB overrides the search for unusual layouts.
+_ad_libdir() {
+  local c d
+  for c in "${AUTODEV_LIB:-}" "$HOME/.local/lib/autodev" "$HOME/lib/autodev" \
+           "/usr/local/lib/autodev" "/usr/lib/autodev" "/opt/autodev/lib"; do
+    [ -n "$c" ] && [ -f "$c/common.sh" ] && { printf '%s' "$c"; return 0; }
+  done
+  d=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || return 1
+  for c in "$d/../lib/autodev" "$d/../lib" "$d/lib"; do
+    [ -f "$c/common.sh" ] && { (CDPATH= cd -- "$c" && pwd); return 0; }
+  done
+  return 1
+}
+if ! _AD_LIB=$(_ad_libdir); then
+  printf 'autodev: cannot find lib/common.sh.\n' >&2
+  printf '  Reinstall, or set AUTODEV_LIB to the directory holding common.sh.\n' >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "$_AD_LIB/common.sh"
+
+echo "=== $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
+
+ANY_RUNNING=0
+SUPERVISOR_DEAD=0
+
+report_job() {
+  local label="$1"
+  ad_load_job "$label" || { echo "-- $label (NO JOB FILE)"; return; }
+
+  # Three distinct states, previously collapsed into "stopped":
+  #   RUNNING  - pidfile present AND that pid is alive
+  #   CRASHED  - pidfile present but the pid is gone (supervisor died)
+  #   IDLE     - no pidfile: never started, drained, paused, or finished
+  # Only CRASHED means "work is not happening".
+  local sup="IDLE"
+  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+    sup="RUNNING"
+  elif [ -f "$PIDFILE" ]; then
+    sup="CRASHED (stale pid $(cat "$PIDFILE" 2>/dev/null))"
+    SUPERVISOR_DEAD=1
+  fi
+  [ -f "$AUTODEV_STATE/$label/PAUSE" ] && sup="$sup, PAUSED"
+  [ -f "$AUTODEV_STATE/$label/DRAINED" ] && sup="$sup, DRAINED"
+
+  # A repo that no longer exists is finished/removed, not idle. Say so plainly
+  # instead of implying an agent is standing by to work it.
+  if [ ! -d "$REPO" ]; then
+    sup="REMOVED (no such repo: $REPO)"
+  fi
+
+  # Attribute each agent to a repo by its working directory. A global scan
+  # listed every agent under every job, which was simply wrong.
+  local pids count
+  pids=$(ad_agent_pids "$REPO")
+  count=$(echo "$pids" | wc -w | tr -d ' ')
+
+  echo "-- $label ($REPO)"
+  echo "   supervisor : $sup"
+
+  if [ "$count" -gt 0 ]; then
+    ANY_RUNNING=1
+    echo "   agent      : RUNNING — $count process(es)"
+    for p in $pids; do
+      printf "               pid=%s elapsed=%ss rss=%sMB\n" "$p" \
+        "$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' ')" \
+        "$(ps -o rss= -p "$p" 2>/dev/null | tr -d ' ' | awk '{print int($1/1024)}')"
+    done
+    [ -f "$HEARTBEAT" ] && echo "   heartbeat  : $(cat "$HEARTBEAT")"
+  else
+    if [ ! -d "$REPO" ]; then
+      echo "   agent      : n/a — repo removed"
+    elif [ -f "$HEARTBEAT" ]; then
+      echo "   agent      : idle between runs — $(cat "$HEARTBEAT")"
+    else
+      echo "   agent      : none"
+    fi
+  fi
+
+  echo "   task       : $(ad_task_label "$REPO" "${JOB_TASKFILE:-}" "${JOB_TASK_RE:-}")"
+
+  if [ -d "$REPO" ]; then
+    echo "   uncommitted: $(cd "$REPO" && git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+    (cd "$REPO" && git --no-pager log --oneline -1 2>/dev/null | sed 's/^/   last commit: /')
+  fi
+}
+
+for job in $(ad_list_jobs); do
+  report_job "$job"
+done
+
+echo "=== $(date -u '+%H:%M:%S UTC') ==="
+echo "-- system --"
+echo "   load: $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)  cores: $(nproc 2>/dev/null)"
+echo "   mem available: $(awk '/MemAvailable/{printf "%.1fGi", $2/1048576}' /proc/meminfo 2>/dev/null)"
+echo "   disk free: $(ad_free_mb "$HOME")MB (min ${MIN_FREE_MB}MB)"
+
+echo "-- verdict --"
+if [ "$ANY_RUNNING" -eq 1 ]; then
+  echo "   AGENT IS RUNNING"
+  exit 1
+fi
+if [ "$SUPERVISOR_DEAD" -eq 1 ]; then
+  echo "   NO AGENT RUNNING and a supervisor CRASHED — work is not happening."
+  echo "   Fix: autodev-daemon status <job>   |   autodev-scheduler start"
+  exit 2
+fi
+echo "   idle / ok"
+exit 0

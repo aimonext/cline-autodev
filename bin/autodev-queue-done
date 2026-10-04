@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# autodev-queue-done — exit 0 when a repo's task queue is fully drained.
+#
+# Used by agos-daemon to decide when to stop looping for good. Exit codes:
+#   0 = queue drained, supervisor should shut down
+#   1 = work remains, keep going
+#   2 = cannot tell (file missing / unparseable) — keep going, fail safe
+#
+# Usage:
+#   autodev-queue-done checkbox <file>
+#   autodev-queue-done table    <file> <STATUS> [STATUS...]
+#
+#   checkbox  counts lines matching "- [ ]" (unchecked Markdown task)
+#   table     counts "| ID | STATUS |" rows whose status is one of STATUS
+#
+# Deliberately conservative: anything it cannot parse is reported as "work
+# remains", because a false "done" would silently abandon a project.
+
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
+
+MODE="${1:-}"
+FILE="${2:-}"
+
+if [ -z "$MODE" ] || [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
+  echo "autodev-queue-done: cannot read '$FILE'" >&2
+  exit 2
+fi
+
+case "$MODE" in
+  checkbox)
+    # `grep -c` prints 0 AND exits 1 when there are no matches, so `|| echo 0`
+    # would append a SECOND line and make N a two-line string. Use `|| true`.
+    N=$(grep -cE '^[[:space:]]*-[[:space:]]*\[[[:space:]]\]' "$FILE" 2>/dev/null || true)
+    ;;
+  table)
+    shift 2
+    [ $# -gt 0 ] || { echo "table mode needs >=1 STATUS word" >&2; exit 2; }
+    pat='^\|[[:space:]]*[A-Za-z]+-[0-9A-Za-z.]+[[:space:]]*\|[[:space:]]*('
+    first=1
+    for s in "$@"; do
+      if [ $first -eq 1 ]; then pat="${pat}${s}"; first=0
+      else pat="${pat}|${s}"; fi
+    done
+    pat="${pat})[[:space:]]*\|"
+    N=$(grep -cE "$pat" "$FILE" 2>/dev/null || true)
+    ;;
+  paired)
+    # Arg positions: $1=paired $2=file $3=heading-regex $4..=terminal tokens.
+    # The regex is $3, NOT $2 — reading $2 passed the FILENAME to awk as the
+    # match pattern, so nothing ever matched and every repo looked "drained".
+    [ $# -ge 4 ] || { echo "paired mode needs <heading-regex> <token> [token...]" >&2; exit 2; }
+    HRE="$3"; shift 3
+    TOXT=""
+    for s in "$@"; do TOXT="$TOXT${TOXT:+,}$s"; done
+    N=$(awk -v hre="$HRE" -v toks="$TOXT" '
+      BEGIN { n=split(toks, a, ","); for(i=1;i<=n;i++) T[a[i]]=1 }
+      $0 ~ hre {
+        if (inhdr && !term) rem++
+        inhdr=1; term=0; next
+      }
+      inhdr && !term {
+        for (t in T) if (index($0, t)) { term=1; break }
+      }
+      END { if (inhdr && !term) rem++; print rem+0 }
+    ' "$FILE" 2>/dev/null || true)
+    ;;
+  *)
+    echo "autodev-queue-done: unknown mode '$MODE'" >&2
+    exit 2
+    ;;
+esac
+
+N=${N:-0}
+if [ "$N" -eq 0 ] 2>/dev/null; then
+  echo "queue drained: $FILE has no remaining tasks"
+  exit 0
+fi
+echo "$N task(s) remaining in $FILE"
+exit 1

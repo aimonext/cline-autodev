@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# autodev-pause / autodev-resume — take a job out of (or back into) the
+# scheduler's rotation without stopping the scheduler. It only writes a marker;
+# it does NOT stop a running job. Pair with `autodev-stop <job>` to stop now.
+#
+# Usage: autodev-pause <job>   |   autodev-resume <job>
+set -uo pipefail
+
+# --- locate the autodev shared library -------------------------------------
+# Works for a system-wide install, a per-user install, or a git checkout.
+# $AUTODEV_LIB overrides the search for unusual layouts.
+_ad_libdir() {
+  local c d
+  for c in "${AUTODEV_LIB:-}" "$HOME/.local/lib/autodev" "$HOME/lib/autodev" \
+           "/usr/local/lib/autodev" "/usr/lib/autodev" "/opt/autodev/lib"; do
+    [ -n "$c" ] && [ -f "$c/common.sh" ] && { printf '%s' "$c"; return 0; }
+  done
+  d=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || return 1
+  for c in "$d/../lib/autodev" "$d/../lib" "$d/lib"; do
+    [ -f "$c/common.sh" ] && { (CDPATH= cd -- "$c" && pwd); return 0; }
+  done
+  return 1
+}
+if ! _AD_LIB=$(_ad_libdir); then
+  printf 'autodev: cannot find lib/common.sh.\n' >&2
+  printf '  Reinstall, or set AUTODEV_LIB to the directory holding common.sh.\n' >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "$_AD_LIB/common.sh"
+
+# Derive the action from this script's own name so `autodev-resume <job>` works
+# via a symlink. Reading $1 as the action (an earlier version) required two
+# arguments, so `autodev-pause myjob` silently printed usage.
+action="${0##*/}"; action="${action#autodev-}"
+job="${1:-}"
+
+if [ "$action" != "pause" ] && [ "$action" != "resume" ]; then
+  action="$1"; job="${2:-}"
+fi
+
+if [ -z "$job" ]; then
+  echo "usage: autodev-pause|autodev-resume <job>"; exit 1
+fi
+
+mkdir -p "$AUTODEV_STATE/$job"
+case "$action" in
+  pause)  touch "$AUTODEV_STATE/$job/PAUSE"; echo "$job paused (scheduler will skip it)" ;;
+  resume) rm -f "$AUTODEV_STATE/$job/PAUSE";  echo "$job resumed" ;;
+  *) echo "usage: autodev-pause|autodev-resume <job>"; exit 1 ;;
+esac

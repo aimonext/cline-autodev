@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# autodev-daemon — multi-repo supervisor for autonomous coding agents.
+#
+# One agent per repository, ever. Two agents in the same git working tree will
+# fight over files and corrupt each other's commits — that is a hard limit, not
+# a tunable. Parallelism is only safe ACROSS repositories.
+#
+# Jobs are declared in ~/.config/autodev/jobs/<name>.conf and run out of
+# ~/.local/state/autodev/<name>/.
+#
+# A job file needs only a repo and a prompt. Everything else is optional:
+#
+#   JOB_NAME      label (defaults to the file name)
+#   JOB_REPO      absolute path to the working tree        [required]
+#   PROMPT        prompt file, or PROMPT_TEXT inline       [required]
+#   JOB_AGENT     agent binary           (default: cline)
+#   JOB_MODEL     model id               (default: $AUTODEV_MODEL)
+#   JOB_THINKING  reasoning effort       (default: $AUTODEV_THINKING)
+#   JOB_TIMEOUT   seconds per run        (default: $AUTODEV_TIMEOUT)
+#   JOB_TASKFILE  progress file, relative to repo         (optional, cosmetic)
+#   JOB_TASK_RE   regex selecting the current task line   (optional, cosmetic)
+#   JOB_DONE_CMD  exit 0 => queue drained, stop looping   (optional)
+#
+# Usage:
+#   autodev-daemon list | start|stop|restart <job> | status [job] | logs <job> [n] | tail <job>
+
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
+
+set -uo pipefail
+
+# --- locate the autodev shared library -------------------------------------
+# Works for a system-wide install, a per-user install, or a git checkout.
+# $AUTODEV_LIB overrides the search for unusual layouts.
+_ad_libdir() {
+  local c d
+  for c in "${AUTODEV_LIB:-}" "$HOME/.local/lib/autodev" "$HOME/lib/autodev" \
+           "/usr/local/lib/autodev" "/usr/lib/autodev" "/opt/autodev/lib"; do
+    [ -n "$c" ] && [ -f "$c/common.sh" ] && { printf '%s' "$c"; return 0; }
+  done
+  d=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || return 1
+  for c in "$d/../lib/autodev" "$d/../lib" "$d/lib"; do
+    [ -f "$c/common.sh" ] && { (CDPATH= cd -- "$c" && pwd); return 0; }
+  done
+  return 1
+}
+if ! _AD_LIB=$(_ad_libdir); then
+  printf 'autodev: cannot find lib/common.sh.\n' >&2
+  printf '  Reinstall, or set AUTODEV_LIB to the directory holding common.sh.\n' >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "$_AD_LIB/common.sh"
+
+mkdir -p "$AUTODEV_STATE/.repo-locks"
+
+job_list() {
+  mkdir -p "$JOBS_DIR"
+  printf '%-16s %-22s %s\n' JOB STATE REPO
+  local n repo pidf st
+  for n in $(ad_list_jobs); do
+    ad_load_job "$n" || continue
+    repo="$REPO"
+    pidf="$AUTODEV_STATE/$n/daemon.pid"
+    st="stopped"
+    if [ -f "$pidf" ] && kill -0 "$(cat "$pidf" 2>/dev/null)" 2>/dev/null; then
+      st="RUNNING"
+    elif [ -f "$AUTODEV_STATE/$n/PAUSE" ]; then
+      st="paused"
+    elif [ -f "$AUTODEV_STATE/$n/DRAINED" ]; then
+      st="DRAINED"
+    fi
+    printf '%-16s %-22s %s\n' "$n" "$st" "$repo"
+  done
+}
+
+cmd_start() {
+  ad_load_job "$1" || ad_die "unknown job: $1"
+  [ -n "$REPO" ] || ad_die "$JOB_NAME: JOB_REPO is not set in $JOB_FILE"
+  if ad_is_running; then echo "$JOB_NAME already running (pid $(cat "$PIDFILE"))"; return 0; fi
+
+  mkdir -p "$REPO_LOCK" "$STATE" "$RUNLOG"
+
+  # One agent per repo, enforced against any owner — including an agent left
+  # behind by a DIFFERENT supervisor. Checking only our own lock file would miss
+  # an orphan and start a second agent into a tree that is already being edited.
+  if [ -f "$REPO_LOCK/owner" ]; then
+    local owner opidf
+    owner=$(cat "$REPO_LOCK/owner" 2>/dev/null)
+    opidf="$AUTODEV_STATE/$owner/daemon.pid"
+    if [ "$owner" != "$JOB_NAME" ] && [ -f "$opidf" ] \
+       && kill -0 "$(cat "$opidf" 2>/dev/null)" 2>/dev/null; then
+      echo "REFUSING: repo already owned by running job '$owner'" >&2
+      echo "One agent per repository — stop '$owner' first." >&2
+      return 1
+    fi
+  fi
+  local live; live=$(ad_agent_count "$REPO")
+  if [ "$live" -gt 0 ]; then
+    echo "REFUSING: $live agent process(es) are already running in $REPO" >&2
+    echo "An unsupervised agent may still be working there. Stop it first." >&2
+    return 1
+  fi
+
+  printf '%s' "$JOB_NAME" > "$REPO_LOCK/owner"
+  rm -f "$STOPFLAG"
+
+  setsid nohup "$0" "__run" "$JOB_NAME" </dev/null >>"$STATE/supervisor.log" 2>&1 &
+  sleep 3
+  if ad_is_running; then
+    echo "$JOB_NAME started (pid $(cat "$PIDFILE")) on $REPO"
+    return 0
+  fi
+  # Not running after the grace period. That is only a failure if the supervisor
+  # is genuinely broken — a job whose queue is already drained exits immediately
+  # and correctly, and reporting that as "FAILED" was misleading.
+  if [ -f "$AUTODEV_STATE/$JOB_NAME/DRAINED" ]; then
+    echo "$JOB_NAME is already drained (queue has no remaining tasks) — nothing started."
+    return 0
+  fi
+  echo "FAILED to start $JOB_NAME — see $STATE/supervisor.log"; return 1
+}
+
+cmd_stop() {
+  ad_load_job "$1" || ad_die "unknown job: $1"
+  touch "$STOPFLAG"
+  if ad_is_running; then
+    local pid; pid=$(cat "$PIDFILE")
+    kill -TERM "$pid" 2>/dev/null
+    sleep 2; kill -KILL "$pid" 2>/dev/null
+    echo "$JOB_NAME stopped"
+  else
+    echo "$JOB_NAME not running"
+  fi
+  rm -f "$PIDFILE" "$REPO_LOCK/owner"
+}
+
+cmd_status() {
+  if [ $# -ge 1 ]; then
+    ad_load_job "$1" || ad_die "unknown job: $1"
+    if ad_is_running; then echo "$JOB_NAME: RUNNING (pid $(cat "$PIDFILE"))"
+    else echo "$JOB_NAME: STOPPED"; fi
+    [ -f "$HEARTBEAT" ] && echo "  heartbeat: $(cat "$HEARTBEAT")"
+    echo "  repo: $REPO"
+    echo "  task: $(ad_task_label "$REPO" "${JOB_TASKFILE:-}" "${JOB_TASK_RE:-}")"
+    echo "  run logs: $(ls -1 "$RUNLOG" 2>/dev/null | wc -l | tr -d ' ') (keeping $KEEP_RUN_LOGS)"
+    return 0
+  fi
+  job_list
+}
+
+cmd_logs() {
+  ad_load_job "$1" || ad_die "unknown job: $1"
+  local n="${2:-3}" f
+  for f in $(ls -t "$RUNLOG"/*.log 2>/dev/null | head -"$n"); do
+    echo "===== $f ====="; tail -40 "$f"
+  done
+}
+
+cmd_tail() { ad_load_job "$1" || ad_die "unknown job: $1"; tail -f "$STATE/supervisor.log"; }
+
+# ---------------------------------------------------------------- the loop
+# Resolve the prompt text once. A job may point at a file (PROMPT) or carry it
+# inline (PROMPT_TEXT); the file form wins when both are present.
+ad_prompt_text() {
+  if [ -n "${PROMPT:-}" ] && [ -f "${PROMPT:-}" ]; then cat "$PROMPT"
+  elif [ -n "${PROMPT_TEXT:-}" ]; then printf '%s\n' "$PROMPT_TEXT"
+  else return 1; fi
+}
+
+__run() {
+  ad_load_job "$1" || exit 1
+  echo $$ > "$PIDFILE"
+  trap 'rm -f "$PIDFILE"; exit 0' TERM INT
+
+  hb() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" > "$HEARTBEAT" 2>/dev/null; }
+
+  echo "=== $JOB_NAME supervisor started $(date -u +%FT%TZ) pid $$ ===" >> "$STATE/supervisor.log"
+  local backoff="$COOLDOWN" failures=0 n=0
+
+  while :; do
+    [ -f "$STOPFLAG" ] && { hb "stop flag set, exiting"; break; }
+
+    # --- completion gate ---------------------------------------------------
+    # The repo decides when it is finished, via JOB_DONE_CMD. Exit 0 = drained,
+    # so the supervisor shuts down permanently instead of waking forever on a
+    # finished project. Absent/unparseable = keep going; a false "done" would
+    # silently abandon work.
+    if [ -n "${JOB_DONE_CMD:-}" ]; then
+      if eval "$JOB_DONE_CMD"; then
+        hb "COMPLETE: queue drained, supervisor exiting"
+        echo "$(date -u +%FT%TZ) queue drained — exiting, no further runs" >> "$STATE/supervisor.log"
+        rm -f "$PIDFILE" "$REPO_LOCK/owner"
+        touch "$AUTODEV_STATE/$JOB_NAME/DRAINED"
+        break
+      fi
+    fi
+
+    # --- disk guard --------------------------------------------------------
+    # A full disk kills the agent mid-build with ENOSPC and loses the work in
+    # progress. Refuse to start instead, and say why.
+    if ! ad_disk_ok "$REPO"; then
+      hb "PAUSED: only $(ad_free_mb "$REPO")MB free (< ${MIN_FREE_MB}MB) — not starting a run"
+      echo "--- disk low at $(date -u +%FT%TZ): $(ad_free_mb "$REPO")MB free" >> "$STATE/supervisor.log"
+      sleep 300
+      continue
+    fi
+
+    n=$((n + 1))
+    local ts log task prompt
+    ts=$(date -u +%Y%m%dT%H%M%SZ)
+    log="$RUNLOG/$ts.log"
+    task=$(ad_task_label "$REPO" "${JOB_TASKFILE:-}" "${JOB_TASK_RE:-}")
+    # Keep transcripts bounded — an unbounded JSON log is how the disk filled.
+    ad_prune_logs "$RUNLOG"
+
+    if ! command -v "$AGENT_CMD" >/dev/null; then
+      hb "ERROR: $AGENT_CMD not on PATH"; sleep "$backoff"; continue
+    fi
+    if [ ! -d "$REPO" ]; then
+      hb "ERROR: repo $REPO missing"; sleep "$backoff"; continue
+    fi
+    prompt=$(ad_prompt_text) || { hb "ERROR: no PROMPT/PROMPT_TEXT in $JOB_FILE"; sleep "$backoff"; continue; }
+
+    # The agent gets a little less than the outer `timeout`, so the supervisor's
+    # TERM lands first and gets a chance to shut down cleanly. Clamp at 1s: a
+    # short JOB_TIMEOUT would otherwise produce a negative --timeout argument.
+    local agent_timeout=$((TIMEOUT - 120))
+    [ "$agent_timeout" -lt 1 ] && agent_timeout=1
+
+    hb "run #$n starting (task: $task)"
+    echo "--- run #$n $(date -u +%FT%TZ) task=[$task] -> $log" >> "$STATE/supervisor.log"
+
+    ( cd "$REPO" && timeout --signal=TERM --kill-after=120 "$TIMEOUT" \
+        "$AGENT_CMD" --auto-approve true \
+              --model "$MODEL" \
+              --thinking "$THINKING" \
+              --timeout "$agent_timeout" \
+              --json \
+              "$prompt" ) > "$log" 2>&1 &
+    local child=$!
+
+    while kill -0 "$child" 2>/dev/null; do
+      [ -f "$STOPFLAG" ] && { kill -TERM "$child" 2>/dev/null; sleep 3; kill -KILL "$child" 2>/dev/null; }
+      hb "run #$n in progress (task: $task)"
+      sleep 20
+    done
+    wait "$child"; local rc=$?
+    [ -f "$STOPFLAG" ] && { hb "stopped during run"; break; }
+
+    if [ $rc -eq 0 ]; then
+      failures=0; backoff="$COOLDOWN"
+      hb "run #$n finished OK (task was: $task)"
+    else
+      failures=$((failures + 1))
+      backoff=$(( backoff * 2 )); [ "$backoff" -gt "$MAX_BACKOFF" ] && backoff=$MAX_BACKOFF
+      hb "run #$n FAILED rc=$rc (failure #$failures, retry in ${backoff}s)"
+      echo "--- run #$n failed rc=$rc" >> "$STATE/supervisor.log"
+    fi
+
+    if [ "$failures" -ge 8 ]; then
+      hb "CIRCUIT BREAKER: $failures consecutive failures, halting $JOB_NAME"
+      echo "CIRCUIT BREAKER $(date -u +%FT%TZ)" >> "$STATE/supervisor.log"
+      break
+    fi
+    sleep "$backoff"
+  done
+  rm -f "$PIDFILE"
+}
+
+case "${1:-list}" in
+  __run)   __run "$2" ;;
+  list)    job_list ;;
+  start)   cmd_start "$2" ;;
+  stop)    cmd_stop "$2" ;;
+  restart) cmd_stop "$2"; sleep 1; cmd_start "$2" ;;
+  status)  shift; cmd_status "$@" ;;
+  logs)    cmd_logs "$2" "${3:-3}" ;;
+  tail)    cmd_tail "$2" ;;
+  *)       echo "usage: autodev-daemon {list|start|stop|restart <job>|status [job]|logs <job> [n]|tail <job>}"; exit 1 ;;
+esac
+

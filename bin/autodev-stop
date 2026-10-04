@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# autodev-stop — stop a job AND any agent process it orphaned.
+#
+# Why this exists: supervisors spawn the agent as a background child. Killing
+# the supervisor alone leaves that child alive, still holding the working
+# directory. If the job is then restarted you get TWO agents editing one repo —
+# the exact failure the one-agent-per-repo lock exists to prevent.
+#
+# Usage: autodev-stop <job>
+
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
+set -uo pipefail
+
+# --- locate the autodev shared library -------------------------------------
+# Works for a system-wide install, a per-user install, or a git checkout.
+# $AUTODEV_LIB overrides the search for unusual layouts.
+_ad_libdir() {
+  local c d
+  for c in "${AUTODEV_LIB:-}" "$HOME/.local/lib/autodev" "$HOME/lib/autodev" \
+           "/usr/local/lib/autodev" "/usr/lib/autodev" "/opt/autodev/lib"; do
+    [ -n "$c" ] && [ -f "$c/common.sh" ] && { printf '%s' "$c"; return 0; }
+  done
+  d=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || return 1
+  for c in "$d/../lib/autodev" "$d/../lib" "$d/lib"; do
+    [ -f "$c/common.sh" ] && { (CDPATH= cd -- "$c" && pwd); return 0; }
+  done
+  return 1
+}
+if ! _AD_LIB=$(_ad_libdir); then
+  printf 'autodev: cannot find lib/common.sh.\n' >&2
+  printf '  Reinstall, or set AUTODEV_LIB to the directory holding common.sh.\n' >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "$_AD_LIB/common.sh"
+
+JOB="${1:-}"
+[ -n "$JOB" ] || { echo "usage: autodev-stop <job>"; exit 1; }
+ad_load_job "$JOB" || { echo "unknown job: $JOB"; exit 1; }
+
+echo "stopping $JOB ..."
+mkdir -p "$STATE"
+
+# 1. Ask the supervisor to wind down gracefully (it polls this flag).
+touch "$STOPFLAG"
+sleep 1
+
+# 2. Kill the supervisor if it is still alive.
+if [ -f "$PIDFILE" ]; then
+  P=$(cat "$PIDFILE")
+  kill -TERM "$P" 2>/dev/null && echo "  supervisor pid $P signalled"
+fi
+sleep 2
+[ -f "$PIDFILE" ] && kill -KILL "$(cat "$PIDFILE")" 2>/dev/null
+
+# 3. Kill ANY agent still sitting in this repo — the step the naive stop misses.
+#    Match on cwd so we never touch another job's agent.
+killed=0
+for p in $(ad_agent_pids "$REPO"); do
+  kill -TERM "$p" 2>/dev/null && killed=$((killed + 1))
+done
+sleep 2
+if [ "$killed" -gt 0 ]; then
+  for p in $(ad_agent_pids "$REPO"); do
+    kill -KILL "$p" 2>/dev/null
+  done
+  echo "  killed $killed orphaned agent process(es) in $REPO"
+else
+  echo "  no orphaned agents in $REPO"
+fi
+
+rm -f "$PIDFILE" "$STOPFLAG" "$REPO_LOCK/owner"
+echo "$JOB stopped."
+
+# 4. Prove it: nothing may still be running in this repo.
+sleep 1
+left=$(ad_agent_count "$REPO")
+if [ "$left" -eq 0 ]; then
+  echo "verified: 0 agents running in $REPO"
+  exit 0
+fi
+echo "WARNING: $left agent(s) still running in $REPO" >&2
+exit 1

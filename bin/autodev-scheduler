@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# autodev-scheduler — keeps N agents running from a priority list.
+#
+# Why: a small box fits only a few agents at once. When one project drains its
+# queue its supervisor exits, and the slot sits idle until a human notices. This
+# fills it automatically.
+#
+# It starts the highest-priority job that is (a) not drained, (b) not already
+# running, (c) not paused, and only while a slot is free.
+#
+# Config:  ~/.config/autodev/slots.conf  (one job name per line, highest
+#          priority first; '#' comments allowed). Every job named there must
+#          have a file in ~/.config/autodev/jobs/.
+# Control: autodev-scheduler {start|stop|restart|status|log}
+#          autodev-pause <job> | autodev-resume <job>   (scheduler respects these)
+#
+# Env:     AUTODEV_SLOTS (default 2), AUTODEV_POLL (seconds, default 60)
+
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
+set -uo pipefail
+
+# --- locate the autodev shared library -------------------------------------
+# Works for a system-wide install, a per-user install, or a git checkout.
+# $AUTODEV_LIB overrides the search for unusual layouts.
+_ad_libdir() {
+  local c d
+  for c in "${AUTODEV_LIB:-}" "$HOME/.local/lib/autodev" "$HOME/lib/autodev" \
+           "/usr/local/lib/autodev" "/usr/lib/autodev" "/opt/autodev/lib"; do
+    [ -n "$c" ] && [ -f "$c/common.sh" ] && { printf '%s' "$c"; return 0; }
+  done
+  d=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || return 1
+  for c in "$d/../lib/autodev" "$d/../lib" "$d/lib"; do
+    [ -f "$c/common.sh" ] && { (CDPATH= cd -- "$c" && pwd); return 0; }
+  done
+  return 1
+}
+if ! _AD_LIB=$(_ad_libdir); then
+  printf 'autodev: cannot find lib/common.sh.\n' >&2
+  printf '  Reinstall, or set AUTODEV_LIB to the directory holding common.sh.\n' >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "$_AD_LIB/common.sh"
+
+PIDFILE="$AUTODEV_STATE/scheduler.pid"
+STOPFLAG="$AUTODEV_STATE/scheduler.STOP"
+LOG="$AUTODEV_STATE/scheduler.log"
+DAEMON="$(cd "$(dirname "$0")" && pwd)/autodev-daemon"
+
+mkdir -p "$AUTODEV_STATE"
+
+log() { ad_log "$1" >> "$LOG"; }
+
+job_running() {
+  local j="$1" p="$AUTODEV_STATE/$j/daemon.pid"
+  [ -f "$p" ] && kill -0 "$(cat "$p" 2>/dev/null)" 2>/dev/null
+}
+
+# Exit 0 => queue drained (job is finished; do not keep restarting it).
+is_drained() {
+  local j="$1" f="$JOBS_DIR/$j.conf"
+  [ -f "$f" ] || f="$JOBS_DIR/$j.env"
+  [ -f "$f" ] || return 1
+  (
+    unset JOB_DONE_CMD
+    # shellcheck disable=SC1090
+    . "$f"
+    [ -n "${JOB_DONE_CMD:-}" ] || exit 1
+    REPO="$JOB_REPO" eval "$JOB_DONE_CMD" >/dev/null 2>&1
+  )
+}
+
+is_paused() { [ -f "$AUTODEV_STATE/$1/PAUSE" ]; }
+
+running_count() {
+  local n=0 j
+  while read -r j; do
+    [ -n "$j" ] || continue
+    case "$j" in \#*) continue ;; esac
+    job_running "$j" && n=$((n + 1))
+  done < "$SLOTS_CONF"
+  echo "$n"
+}
+
+start_job() {
+  local j="$1" out
+  mkdir -p "$AUTODEV_STATE/$j"
+  # Close fd 9 (the scheduler's flock) in the child. Without `9>&-` the spawned
+  # daemon INHERITS the lock and holds it for its whole life, so the scheduler
+  # can never be restarted — the lock appears held by a process that is not it.
+  if out=$("$DAEMON" start "$j" 2>&1 9>&-); then
+    log "STARTED $j"
+    echo "$out"
+  else
+    log "FAILED  $j :: $(echo "$out" | tr '\n' ' ')"
+    echo "$out" >&2
+  fi
+}
+
+scheduler_loop() {
+  # Single-instance guard. A duplicate boot entry (or an accidental double
+  # `start`) would otherwise run two schedulers, each independently deciding to
+  # fill the free slot — starting two DIFFERENT jobs and blowing past MAX_SLOTS.
+  local lock="$AUTODEV_STATE/scheduler.lock"
+  exec 9>"$lock"
+  if ! flock -n 9; then
+    log "another scheduler already holds the lock; exiting"
+    exit 0
+  fi
+  echo $$ > "$PIDFILE"
+  # Only clear the pidfile if it is still OURS. A plain `rm` races: when an old
+  # scheduler shuts down as a new one starts, the old one's trap deletes the
+  # NEW one's pidfile, leaving a live scheduler status/stop cannot see.
+  cleanup() {
+    log "scheduler stopping"
+    if [ -f "$PIDFILE" ] && [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ]; then
+      rm -f "$PIDFILE"
+    fi
+    exit 0
+  }
+  trap cleanup TERM INT
+  log "scheduler started (pid $$), max_slots=$MAX_SLOTS"
+  while :; do
+    [ -f "$STOPFLAG" ] && { log "stop flag set"; break; }
+    [ -f "$SLOTS_CONF" ] || { sleep "$POLL"; continue; }
+
+    n=$(running_count)
+    if [ "$n" -lt "$MAX_SLOTS" ]; then
+      while read -r j; do
+        [ -n "$j" ] || continue
+        case "$j" in \#*) continue ;; esac
+        [ -f "$JOBS_DIR/$j.conf" ] || [ -f "$JOBS_DIR/$j.env" ] || {
+          log "SKIP $j (no job file in $JOBS_DIR)"; continue; }
+        job_running "$j" && continue
+        is_paused "$j" && continue
+        if is_drained "$j"; then
+          log "SKIP $j (queue drained)"
+          touch "$AUTODEV_STATE/$j/DRAINED"   # remember, stop re-evaluating
+          continue
+        fi
+        [ -f "$AUTODEV_STATE/$j/DRAINED" ] && rm -f "$AUTODEV_STATE/$j/DRAINED"
+        log "slot free ($n/$MAX_SLOTS) -> starting $j"
+        start_job "$j"
+        n=$((n + 1))
+        [ "$n" -ge "$MAX_SLOTS" ] && break
+      done < "$SLOTS_CONF"
+    fi
+    sleep "$POLL"
+  done
+  rm -f "$PIDFILE"
+}
+
+cmd_status() {
+  echo "scheduler: $([ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null && echo RUNNING || echo STOPPED)"
+  echo "max_slots=$MAX_SLOTS  running=$(running_count)"
+  printf '%-22s %-9s %s\n' JOB KNOWN STATUS
+  local j note
+  while read -r j; do
+    [ -n "$j" ] || continue
+    case "$j" in \#*) continue ;; esac
+    if is_paused "$j"; then note="paused"
+    elif job_running "$j"; then note="running"
+    elif is_drained "$j"; then note="DONE (queue drained)"
+    else note="queued"; fi
+    printf '%-22s %-9s %s\n' "$j" \
+      "$([ -f "$JOBS_DIR/$j.conf" ] || [ -f "$JOBS_DIR/$j.env" ] && echo yes || echo NO)" "$note"
+  done < "$SLOTS_CONF" 2>/dev/null
+  echo "--- last actions ---"; tail -5 "$LOG" 2>/dev/null
+}
+
+case "${1:-status}" in
+  __loop)  scheduler_loop ;;
+  start)
+    rm -f "$STOPFLAG"
+    setsid nohup "$0" __loop </dev/null >>"$AUTODEV_STATE/scheduler.out" 2>&1 &
+    sleep 2
+    [ -f "$PIDFILE" ] && echo "scheduler started (pid $(cat "$PIDFILE"))" || { echo "FAILED - see $LOG"; exit 1; }
+    ;;
+  stop)
+    touch "$STOPFLAG"
+    if [ -f "$PIDFILE" ]; then kill -TERM "$(cat "$PIDFILE")" 2>/dev/null; sleep 1; rm -f "$PIDFILE"; fi
+    echo "scheduler stopped"
+    ;;
+  restart) "$0" stop; sleep 1; "$0" start ;;
+  status)  cmd_status ;;
+  log)     tail -30 "$LOG" 2>/dev/null ;;
+  *) echo "usage: autodev-scheduler {start|stop|restart|status|log}"; exit 1 ;;
+esac
