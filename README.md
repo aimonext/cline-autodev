@@ -62,6 +62,35 @@ autodev-status
 `autodev-add` detects: Rust, PHP/Laravel, Node, Python, Go, Make, or falls back
 to `generic`. It writes a prompt containing that stack's real verify commands.
 
+## Session continuity
+
+Cline **cannot resume a session unattended**. `cline --id <session-id>` exists
+but always forces interactive mode and refuses to run without a TTY, the hub
+exposes no continuation API, and `cline history` has no `continue` subcommand.
+So every supervised run is a cold session.
+
+autodev reduces the cost of that cold start instead:
+
+- **First run** uses `PROMPT` and does a full orientation.
+- **Every later run** uses `PROMPT_CONTINUE`, which tells the agent it has no
+  memory, forbids re-reading the project's documentation, and points it at its
+  hand-off files.
+- The previous run's **closing summary** is extracted from its transcript and
+  appended to the next prompt. The agent already wrote it; reusing it is free.
+
+State lives in the job's state dir:
+
+```
+coldstart.done     written after any finished run; delete to force full orientation
+last-summary       the carried closing summary
+```
+
+Measured effect is in the *document reads skipped*, not prompt size — the two
+prompts are nearly the same length. The carried summary is advisory: it is the
+agent's own words and may be stale, truncated, or missing when a run was killed.
+
+See [AGENTS.md §7](AGENTS.md) for the full analysis and its limits.
+
 ## Safety
 
 - **One agent per repository, enforced.** `start` refuses when any agent process

@@ -85,6 +85,7 @@ backwards compatibility). Sourced as shell, so it must live in a user-owned dir.
 |---|---|---|
 | `JOB_REPO` | **yes** | absolute path to the working tree |
 | `PROMPT` / `PROMPT_TEXT` | **yes** | prompt file path, or inline text |
+| `PROMPT_CONTINUE` | no | shorter prompt used from the 2nd run onward |
 | `JOB_NAME` | no | label; defaults to the file name |
 | `JOB_AGENT` | no | agent binary (default `cline`) |
 | `JOB_MODEL` / `JOB_THINKING` / `JOB_TIMEOUT` | no | per-job overrides |
@@ -133,7 +134,64 @@ at any moment, and reporting that as a failure cried wolf.
 fail-safe: the supervisor keeps going, because a false "done" silently abandons
 a project.
 
-## 7. How the supervisor loop works
+## 7. Session continuity — what it really does
+
+**Cline cannot resume a session unattended.** This was tested, not assumed.
+`cline --id <session-id>` exists ("Resume an existing session by ID") but always
+forces interactive mode:
+
+| Invocation | Result |
+|---|---|
+| `--id <id> --json "<prompt>"` | `JSON output mode requires a prompt argument or piped stdin (interactive mode is unsupported)` |
+| `--id <id> --json` + prompt on stdin | same refusal |
+| `--id <id> "<prompt>"` (no `--json`) | `interactive mode requires a TTY (stdin/stdout must both be terminals)` |
+
+The running hub (`--cline-hub-daemon`) exposes no session-continuation API —
+`/hub`, `/hub/sessions`, `/hub/api/sessions`, `/hub/openapi.json` all return
+404 — and `cline history` offers only `delete`, `update`, `export`. There is no
+`continue` subcommand.
+
+**Therefore every supervised run is necessarily a cold session.** Do not add a
+`cline schedule` or `--id` integration hoping to change this.
+
+Given that, autodev attacks the *cost* of a cold start instead:
+
+1. **`PROMPT_CONTINUE`** — the first run of a job uses `PROMPT`, which does a
+   full orientation. Every later run uses `PROMPT_CONTINUE`, which forbids
+   re-reading the project's documentation and points the agent at its hand-off
+   files instead. The prompt text is barely smaller; **the saving is in the
+   document reads the agent no longer performs**, which is where the tokens go.
+2. **Carried summary** — `ad_capture_summary` pulls the closing `done` event's
+   text out of the finished run's transcript and `ad_continue_prompt` appends it
+   to the next run's prompt. The agent already wrote that summary; reusing it is
+   free.
+
+Measured on a real job: 6 of 8 run logs contain a `done` event and yield a
+usable summary (~2KB). The 2 that do not were killed mid-run, so no summary
+exists — extraction correctly returns failure and the run simply gets the plain
+continuation prompt.
+
+### Warm/cold state
+
+- `$STATE/coldstart.done` — written after **any** finished run, success or not.
+  A failed run still learned things; its retry should not re-orient from zero.
+- `$STATE/last-summary` — the captured closing text.
+
+Delete `coldstart.done` to force the next run to do a full orientation.
+
+### Honest limits of this design
+
+- The summary is the agent's **own words** and is injected as a *record*, not an
+  instruction. The continuation prompt says so explicitly, because a stale or
+  mistaken summary must not silently steer the next session.
+- `ad_capture_summary` uses `grep -o '"text":"[^"]*"'`, so a summary containing
+  an escaped quote is truncated at that quote. It degrades to a shorter summary,
+  never to a corrupt one. Do not "fix" this with a JSON parser dependency.
+- Streaming `content_start` deltas are **not** reassembled — on a long run those
+  are the entire transcript, and rebuilding them in shell would be slow and
+  fragile.
+
+## 8. How the supervisor loop works
 
 `__run` in `bin/autodev-daemon`, once per iteration:
 
@@ -141,11 +199,13 @@ a project.
 2. If `JOB_DONE_CMD` exits 0 → write `DRAINED`, exit permanently.
 3. If free disk `< MIN_FREE_MB` → heartbeat, sleep 300s, **do not start a run**.
 4. Prune run logs to `KEEP_RUN_LOGS`.
-5. Write heartbeat, then spawn the agent as a background child under `timeout`.
-6. Poll every 20s: refresh heartbeat, honour a `STOP` flag that appears.
-7. On exit: `rc==0` resets backoff to `COOLDOWN`; failure doubles backoff up to
-   `MAX_BACKOFF`.
-8. 8 consecutive failures → circuit breaker, halt the job.
+5. Choose the prompt: `PROMPT_CONTINUE` if the job is warm and one is
+   configured, otherwise `PROMPT`.
+6. Write heartbeat, then spawn the agent as a background child under `timeout`.
+7. Poll every 20s: refresh heartbeat, honour a `STOP` flag that appears.
+8. On exit: capture the closing summary, mark the job warm. `rc==0` resets
+   backoff to `COOLDOWN`; failure doubles backoff up to `MAX_BACKOFF`.
+9. 8 consecutive failures → circuit breaker, halt the job.
 
 The agent is invoked exactly as:
 
@@ -166,14 +226,14 @@ never be one. Cline's `schedule` subsystem is unreliable (it queues runs that
 never dispatch). Continuity here comes **solely** from `autodev-daemon` and
 `autodev-scheduler`. If you are tempted to add a schedule integration, do not.
 
-## 8. Process detection
+## 9. Process detection
 
 ```sh
 ad_agent_comm()   # basename of $AGENT_CMD prefixed with "."  -> cline becomes ".cline"
 ad_agent_pids()   # pgrep -f -- "--auto-approve", filtered by /proc/<pid>/comm, then by cwd
 ```
 
-## 9. Known limitations — read before "fixing" anything
+## 10. Known limitations — read before "fixing" anything
 
 These are real and deliberate. Each has a reason.
 
@@ -202,8 +262,13 @@ These are real and deliberate. Each has a reason.
 7. **Pidfile cleanup is conditional.** The scheduler only removes its pidfile if
    it still contains its own `$$`. A plain `rm` races with a restarting
    successor and orphans a live scheduler.
+8. **Session continuity is a mitigation, not a fix.** Cline cannot resume a
+   session unattended (see §7), so autodev reduces cold-start cost instead. The
+   carried summary is the agent's own text and may be stale, truncated at an
+   escaped quote, or absent entirely. It is advisory. Do not let any decision
+   depend on it, and do not describe it to users as "session resume".
 
-## 10. Before you commit
+## 11. Before you commit
 
 ```sh
 sh -n install.sh                      # POSIX sh
@@ -232,7 +297,7 @@ PATH="$HOME/.local/bin:$PATH" autodev-status
 agents.** Starting a second agent in a repo that already has one is the exact
 failure this project exists to prevent.
 
-## 11. Rules for changing this codebase
+## 12. Rules for changing this codebase
 
 - **Never weaken a safety check to make something pass.** No removing the
   process scan, no lowering the disk guard, no deleting a test.

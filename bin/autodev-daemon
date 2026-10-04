@@ -159,11 +159,22 @@ cmd_logs() {
 cmd_tail() { ad_load_job "$1" || ad_die "unknown job: $1"; tail -f "$STATE/supervisor.log"; }
 
 # ---------------------------------------------------------------- the loop
-# Resolve the prompt text once. A job may point at a file (PROMPT) or carry it
-# inline (PROMPT_TEXT); the file form wins when both are present.
+# Resolve the prompt. A job may point at a file (PROMPT) or carry it inline
+# (PROMPT_TEXT).
+#
+# PROMPT_CONTINUE is the optimisation that matters on a long-lived job. Cline
+# cannot resume a session unattended (`--id` demands a TTY), so every run is a
+# cold session that re-reads its whole context from disk. The first run must pay
+# for a full orientation; every run after it only needs the handoff, so
+# PROMPT_CONTINUE is a short prompt that tells the agent exactly that.
+# Falls back to the full prompt whenever a continuation one is not configured.
 ad_prompt_text() {
-  if [ -n "${PROMPT:-}" ] && [ -f "${PROMPT:-}" ]; then cat "$PROMPT"
-  elif [ -n "${PROMPT_TEXT:-}" ]; then printf '%s\n' "$PROMPT_TEXT"
+  local warm="${1:-0}"
+  if [ "$warm" = "1" ] && [ -n "${PROMPT_CONTINUE:-}" ] && [ -f "${PROMPT_CONTINUE}" ]; then
+    ad_continue_prompt; return 0
+  fi
+  if [ -n "${PROMPT:-}" ] && [ -f "${PROMPT:-}" ]; then cat "$PROMPT"; return 0
+  elif [ -n "${PROMPT_TEXT:-}" ]; then printf '%s\n' "$PROMPT_TEXT"; return 0
   else return 1; fi
 }
 
@@ -219,7 +230,8 @@ __run() {
     if [ ! -d "$REPO" ]; then
       hb "ERROR: repo $REPO missing"; sleep "$backoff"; continue
     fi
-    prompt=$(ad_prompt_text) || { hb "ERROR: no PROMPT/PROMPT_TEXT in $JOB_FILE"; sleep "$backoff"; continue; }
+    prompt=$(ad_prompt_text "$(ad_is_warm)") || {
+      hb "ERROR: no PROMPT/PROMPT_TEXT in $JOB_FILE"; sleep "$backoff"; continue; }
 
     # The agent gets a little less than the outer `timeout`, so the supervisor's
     # TERM lands first and gets a chance to shut down cleanly. Clamp at 1s: a
@@ -246,6 +258,17 @@ __run() {
     done
     wait "$child"; local rc=$?
     [ -f "$STOPFLAG" ] && { hb "stopped during run"; break; }
+
+    # Capture the agent's own closing summary for the next run, and mark the
+    # job warm. Both happen on ANY finished run, successful or not: a failed run
+    # still learned things, and its next retry should not re-orient from zero.
+    # Without this marker every run pays full cold-start cost, which is the
+    # dominant per-run expense.
+    local summary; summary=$(ad_summary_path)
+    if ad_capture_summary "$log" "$summary"; then
+      echo "--- run #$n captured closing summary ($(wc -c < "$summary") bytes)" >> "$STATE/supervisor.log"
+    fi
+    : > "$STATE/$WARM_MARKER"
 
     if [ $rc -eq 0 ]; then
       failures=0; backoff="$COOLDOWN"
