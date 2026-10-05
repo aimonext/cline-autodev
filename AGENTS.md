@@ -268,11 +268,66 @@ These are real and deliberate. Each has a reason.
    escaped quote, or absent entirely. It is advisory. Do not let any decision
    depend on it, and do not describe it to users as "session resume".
 
-## 11. Before you commit
+## 11. Queue drain detection (`autodev-queue-done`)
+
+`JOB_DONE_CMD` is the supervisor's **drain gate**: exit 0 means the project is
+finished and the supervisor exits permanently. A false "done" therefore does not
+merely miscount — it **abandons the project**. That asymmetry governs every
+design choice below.
+
+Exit codes: `0` drained, `1` work remains, `2` cannot tell (fail-safe: keep
+going).
+
+### Modes
+
+| Mode | Counts | Used by |
+|---|---|---|
+| `checkbox <file>` | `- [ ]` lines | agos-tasks, agos-security |
+| `table <file> <STATUS>...` | rows whose status column matches | agos-communication, agos-environment |
+| `paired <file> <heading-re> <TOKEN>...` | heading blocks with no terminal token | agos-tools |
+
+### The paired-mode rule (this was a real bug)
+
+The original rule was `index($0, token)` — a block counted as finished if the
+token appeared **anywhere** in it. Real queue files mention earlier tasks:
+
+```
+### T076 — Add Core integration client examples
+**Status:** TODO (2026-10-04 — next actionable) — T075 is DONE.
+```
+
+That trailing reference marked T076 complete. It undercounted by one, and if the
+*last* task in a queue had said the same thing the queue would have been
+reported fully drained and **the supervisor would have exited for good**.
+
+Current rule, in order:
+
+1. A line declaring `Status:` is **authoritative** — the first word after it
+   decides, and later prose cannot override it.
+2. With no status line in the block, a token at the **start** of a line counts.
+3. Otherwise the block is **not** terminal. Fail-safe.
+
+Word boundaries are explicit character classes plus `$`, not `\b`, so gawk,
+mawk and busybox awk agree. The `$` matters: a status of exactly `DONE` with
+nothing after it is the common case, and requiring a following character
+silently failed to match it.
+
+### Tests
+
+```sh
+./tests/queue-done-test.sh      # 10 cases, exits non-zero on failure
+```
+
+Run this before and after touching `bin/autodev-queue-done`. It covers the bug
+above, the abandon-the-project scenario, both `**Status:**` spacing variants,
+multiple terminal tokens, status-less blocks, and the `2` fail-safe paths.
+
+## 12. Before you commit
 
 ```sh
 sh -n install.sh                      # POSIX sh
-for f in bin/* lib/common.sh; do bash -n "$f"; done
+for f in bin/* lib/common.sh tests/*.sh; do bash -n "$f"; done
+./tests/queue-done-test.sh
 ```
 
 Then, in a **throwaway `HOME`** so you never disturb a running machine:
@@ -297,7 +352,7 @@ PATH="$HOME/.local/bin:$PATH" autodev-status
 agents.** Starting a second agent in a repo that already has one is the exact
 failure this project exists to prevent.
 
-## 12. Rules for changing this codebase
+## 13. Rules for changing this codebase
 
 - **Never weaken a safety check to make something pass.** No removing the
   process scan, no lowering the disk guard, no deleting a test.

@@ -52,14 +52,57 @@ case "$MODE" in
     HRE="$3"; shift 3
     TOXT=""
     for s in "$@"; do TOXT="$TOXT${TOXT:+,}$s"; done
+    # A heading block is terminal ONLY when a token appears in a status
+    # position — never merely because the word appears somewhere in the prose.
+    #
+    # The old rule was `index($0, token)`, which misread real queue files. A
+    # task may legitimately mention an earlier one:
+    #     ### T076 — Add Core integration client examples
+    #     **Status:** TODO (2026-10-04 — next actionable) — T075 is DONE.
+    # That trailing reference made T076 count as complete, so the queue
+    # under-reported by one — and, worse, the same rule can report a queue as
+    # fully drained while work remains, which makes the supervisor exit for good
+    # and abandon the project. A false "done" is the one failure this tool must
+    # never make.
+    #
+    # Rules, in order:
+    #   1. A line declaring `Status:` is authoritative. The first word after it
+    #      decides. Once seen, later prose cannot override it.
+    #   2. With no status line in the block, a token at the START of a line
+    #      counts (covers `- [x] SEC-001 — DONE` and table-ish layouts).
+    #   3. Otherwise the block is treated as NOT terminal — fail-safe.
+    #
+    # Boundaries are written as explicit character classes rather than \b so
+    # this behaves identically under gawk, mawk and busybox awk.
     N=$(awk -v hre="$HRE" -v toks="$TOXT" '
+      # The boundary must accept END OF STRING as well as a non-word character:
+      # a status value of exactly "DONE" with nothing after it is the common
+      # case, and requiring a following character silently failed to match it.
+      function is_token(s,   t) {
+        for (t in T) if (match(s, "^" t "([^A-Za-z0-9_]|$)")) return 1
+        return 0
+      }
       BEGIN { n=split(toks, a, ","); for(i=1;i<=n;i++) T[a[i]]=1 }
       $0 ~ hre {
         if (inhdr && !term) rem++
-        inhdr=1; term=0; next
+        inhdr=1; term=0; sawstatus=0; next
       }
       inhdr && !term {
-        for (t in T) if (index($0, t)) { term=1; break }
+        line=$0
+        # (1) explicit status declaration wins, and is final for this block
+        if (match(line, "[Ss][Tt][Aa][Tt][Uu][Ss][^:]*:[[:space:]]*")) {
+          sawstatus=1
+          rest = substr(line, RSTART + RLENGTH)
+          gsub(/^[*_`[:space:]]+/, "", rest)
+          if (is_token(rest)) term=1
+          next
+        }
+        # (2) fallback: token at the start of a line
+        if (!sawstatus) {
+          s = line
+          gsub(/^[[:space:]]*([-*+][[:space:]]+|\|)?[[:space:]]*[*_`[:space:]]*/, "", s)
+          if (is_token(s)) term=1
+        }
       }
       END { if (inhdr && !term) rem++; print rem+0 }
     ' "$FILE" 2>/dev/null || true)
